@@ -15,6 +15,10 @@ namespace gazebo
   GazeboRosLinkAttacher::GazeboRosLinkAttacher() :
     nh_("link_attacher_node")
   {
+    std::vector<fixedJoint> vect;
+    this->detach_vector = vect;
+    this->beforePhysicsUpdateConnection = 
+      event::Events::ConnectBeforePhysicsUpdate(std::bind(&GazeboRosLinkAttacher::OnUpdate, this));
   }
 
 
@@ -34,7 +38,11 @@ namespace gazebo
     }
     
     this->world = _world;
-    this->physics = this->world->Physics();
+    #if GAZEBO_VERSION_MAJOR > 7
+      this->physics = this->world->Physics();
+    #else
+      this->physics = this->world->GetPhysicsEngine();
+    #endif
     this->attach_service_ = this->nh_.advertiseService("attach", &GazeboRosLinkAttacher::attach_callback, this);
     ROS_INFO_STREAM("Attach service at: " << this->nh_.resolveName("attach"));
     this->detach_service_ = this->nh_.advertiseService("detach", &GazeboRosLinkAttacher::detach_callback, this);
@@ -64,17 +72,46 @@ namespace gazebo
     j.model2 = model2;
     j.link2 = link2;
     ROS_DEBUG_STREAM("Getting BasePtr of " << model1);
-    physics::BasePtr b1 = this->world->ModelByName(model1);
-
+    #if GAZEBO_VERSION_MAJOR > 7
+      physics::BasePtr b1 = this->world->ModelByName(model1);
+    #else
+      physics::BasePtr b1 = this->world->GetModel(model1);
+    #endif    
     if (b1 == NULL){
       ROS_ERROR_STREAM(model1 << " model was not found");
       return false;
     }
+    
     ROS_DEBUG_STREAM("Getting BasePtr of " << model2);
-    physics::BasePtr b2 = this->world->ModelByName(model2);
+    #if GAZEBO_VERSION_MAJOR > 7
+      physics::BasePtr b2 = this->world->ModelByName(model2);
+    #else
+      physics::BasePtr b2 = this->world->GetModel(model2);
+    #endif
     if (b2 == NULL){
       ROS_ERROR_STREAM(model2 << " model was not found");
       return false;
+    }
+    
+    #define DONOT_ATTACH_STATIC_MODEL 1
+    if(DONOT_ATTACH_STATIC_MODEL){ // if link is static dont attch it!
+      physics::Model* m1 = (physics::Model*)b1.get();
+      physics::Model* m2 = (physics::Model*)b2.get();
+      physics::LinkPtr l1 = m1->GetLink(link1);
+      physics::LinkPtr l2 = m2->GetLink(link2);
+      if(l1 == NULL){
+        ROS_ERROR_STREAM(link1 << " link was not found");
+        return false;
+      }else if(l2 == NULL){
+        ROS_ERROR_STREAM(link2 << " link was not found");
+        return false;
+      }
+
+      if(l1->IsStatic() || l2->IsStatic()){
+        ROS_INFO("Has static link, attach canceled!");
+        return false;
+      }
+
     }
 
     ROS_DEBUG_STREAM("Casting into ModelPtr");
@@ -93,8 +130,13 @@ namespace gazebo
         ROS_ERROR_STREAM("link1 inertia is NULL!");
     }
     else
+      #if GAZEBO_VERSION_MAJOR > 7
         ROS_DEBUG_STREAM("link1 inertia is not NULL, for example, mass is: " << l1->GetInertial()->Mass());
+      #else
+        ROS_DEBUG_STREAM("link1 inertia is not NULL, for example, mass is: " << l1->GetInertial()->GetMass());
+      #endif
     j.l1 = l1;
+
     ROS_DEBUG_STREAM("Getting link: '" << link2 << "' from model: '" << model2 << "'");
     physics::LinkPtr l2 = m2->GetLink(link2);
     if (l2 == NULL){
@@ -105,7 +147,11 @@ namespace gazebo
         ROS_ERROR_STREAM("link2 inertia is NULL!");
     }
     else
+      #if GAZEBO_VERSION_MAJOR > 7
         ROS_DEBUG_STREAM("link2 inertia is not NULL, for example, mass is: " << l2->GetInertial()->Mass());
+      #else
+        ROS_DEBUG_STREAM("link2 inertia is not NULL, for example, mass is: " << l2->GetInertial()->GetMass());
+      #endif    
     j.l2 = l2;
 
     ROS_DEBUG_STREAM("Links are: "  << l1->GetName() << " and " << l2->GetName());
@@ -126,7 +172,6 @@ namespace gazebo
      failed in void gazebo::physics::Entity::PublishPose():
      /tmp/buildd/gazebo2-2.2.3/gazebo/physics/Entity.cc(225):
      An entity without a parent model should not happen
-
      * If SetModel is given the same model than CreateJoint given
      * Gazebo crashes with
      * ***** Internal Program Error - assertion (self->inertial != __null)
@@ -151,7 +196,8 @@ namespace gazebo
       // search for the instance of joint and do detach
       fixedJoint j;
       if(this->getJoint(model1, link1, model2, link2, j)){
-          j.joint->Detach();
+          this->detach_vector.push_back(j);
+          ROS_INFO_STREAM("Detach joint request pushed in the detach vector");
           return true;
       }
 
@@ -208,6 +254,26 @@ namespace gazebo
         res.ok = true;
       }
       return true;
+  }
+
+  // thanks to https://answers.gazebosim.org/question/12118/intermittent-segmentation-fault-possibly-by-custom-worldplugin-attaching-and-detaching-child/?answer=24271#post-id-24271
+  void GazeboRosLinkAttacher::OnUpdate()
+  {
+    if(!this->detach_vector.empty())
+    {
+      ROS_INFO_STREAM("Received before physics update callback... Detaching joints");
+      std::vector<fixedJoint>::iterator it;
+      it = this->detach_vector.begin();
+      fixedJoint j;
+      while (it != this->detach_vector.end())
+      {
+        j = *it;
+        j.joint->Detach();
+        ROS_INFO_STREAM("Joint detached !");
+        ++it;
+      }
+      detach_vector.clear();
+    }
   }
 
 }
